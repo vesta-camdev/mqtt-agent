@@ -1,0 +1,102 @@
+import asyncio
+import json
+import asyncpg
+import paho.mqtt.client as mqtt
+from datetime import datetime
+
+EDGE_DB_URL = "postgresql://postgres:postgres@localhost:5432/vis_db"
+MQTT_BROKER = "192.168.18.234"
+MQTT_PORT = 1883
+
+PUB_TOPIC = "edge/to/core/detection_alerts"
+SUB_TOPICS = [
+    "core/to/edge/cameras",
+    "core/to/edge/advanced_rules",
+    "core/to/edge/advanced_rulesets",
+    "core/to/edge/rule_assignments",
+]
+
+last_seen_id = 0
+
+# ---------------- MQTT ----------------
+mqtt_client = mqtt.Client()
+
+# ---------------- DB ----------------
+async def get_pool():
+    return await asyncpg.create_pool(EDGE_DB_URL)
+
+# ---------------- PUBLISH ALERTS ----------------
+async def publish_detection_alerts(pool):
+    global last_seen_id
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT * FROM detection_alerts
+            WHERE id > $1
+            ORDER BY id ASC
+            """,
+            last_seen_id
+        )
+
+        for row in rows:
+            payload = dict(row)
+            last_seen_id = row["id"]
+
+            mqtt_client.publish(
+                PUB_TOPIC,
+                json.dumps({
+                    "table": "detection_alerts",
+                    "op": "upsert",
+                    "data": payload
+                }),
+                qos=1
+            )
+
+# ---------------- APPLY CORE UPDATES ----------------
+async def apply_core_update(pool, table, data):
+    cols = ", ".join(data.keys())
+    placeholders = ", ".join(f"${i+1}" for i in range(len(data)))
+    updates = ", ".join(f"{k}=EXCLUDED.{k}" for k in data.keys())
+
+    sql = f"""
+    INSERT INTO {table} ({cols})
+    VALUES ({placeholders})
+    ON CONFLICT (id) DO UPDATE SET
+    {updates}
+    """
+
+    async with pool.acquire() as conn:
+        await conn.execute(sql, *data.values())
+
+# ---------------- MQTT HANDLER ----------------
+def on_message(client, userdata, msg):
+    payload = json.loads(msg.payload.decode())
+    asyncio.run_coroutine_threadsafe(
+        apply_core_update(
+            userdata["pool"],
+            payload["table"],
+            payload["data"]
+        ),
+        userdata["loop"]
+    )
+
+# ---------------- MAIN ----------------
+async def main():
+    pool = await get_pool()
+    loop = asyncio.get_running_loop()
+
+    mqtt_client.user_data_set({"pool": pool, "loop": loop})
+    mqtt_client.on_message = on_message
+
+    mqtt_client.connect(MQTT_BROKER, MQTT_PORT)
+    for t in SUB_TOPICS:
+        mqtt_client.subscribe(t, qos=1)
+
+    mqtt_client.loop_start()
+
+    while True:
+        await publish_detection_alerts(pool)
+        await asyncio.sleep(2)
+
+asyncio.run(main())
