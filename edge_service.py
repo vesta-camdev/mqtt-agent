@@ -24,8 +24,8 @@ PUB_TOPICS = {
 }
 SUB_TOPICS = [
     "core/to/edge/cameras",
-    "core/to/edge/advanced_rules",
     "core/to/edge/advanced_rulesets",
+    "core/to/edge/advanced_rules",
     "core/to/edge/rule_assignments",
 ]
 
@@ -95,31 +95,63 @@ async def publish_rule_assignments(pool):
 
 # ---------------- APPLY CORE UPDATES ----------------
 async def apply_core_update(pool, table, data):
-    cols = ", ".join(data.keys())
-    placeholders = ", ".join(f"${i+1}" for i in range(len(data)))
-    updates = ", ".join(f"{k}=EXCLUDED.{k}" for k in data.keys())
+    try:
+        print(f"[{table}] Received core update for record ID {data.get('id', 'unknown')}")
+        
+        # Convert ISO datetime strings back to datetime objects
+        processed_data = {}
+        datetime_fields = ['created_at', 'updated_at', 'event_time', 'acknowledged_at']
+        
+        for key, value in data.items():
+            if key in datetime_fields and isinstance(value, str) and value:
+                try:
+                    # Parse ISO format datetime string back to datetime object
+                    processed_data[key] = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                except ValueError:
+                    processed_data[key] = value
+            else:
+                processed_data[key] = value
+        
+        cols = ", ".join(processed_data.keys())
+        placeholders = ", ".join(f"${i+1}" for i in range(len(processed_data)))
+        updates = ", ".join(f"{k}=EXCLUDED.{k}" for k in processed_data.keys())
 
-    sql = f"""
-    INSERT INTO {table} ({cols})
-    VALUES ({placeholders})
-    ON CONFLICT (id) DO UPDATE SET
-    {updates}
-    """
+        sql = f"""
+        INSERT INTO {table} ({cols})
+        VALUES ({placeholders})
+        ON CONFLICT (id) DO UPDATE SET
+        {updates}
+        """
 
-    async with pool.acquire() as conn:
-        await conn.execute(sql, *data.values())
+        async with pool.acquire() as conn:
+            await conn.execute(sql, *processed_data.values())
+            print(f"[{table}] Successfully applied core update for record ID {processed_data.get('id', 'unknown')}")
+            
+    except Exception as e:
+        print(f"[{table}] ERROR applying core update: {e}")
+        print(f"[{table}] Data that failed: {data}")
 
 # ---------------- MQTT HANDLER ----------------
 def on_message(client, userdata, msg):
-    payload = json.loads(msg.payload.decode())
-    asyncio.run_coroutine_threadsafe(
-        apply_core_update(
-            userdata["pool"],
-            payload["table"],
-            payload["data"]
-        ),
-        userdata["loop"]
-    )
+    try:
+        payload = json.loads(msg.payload.decode())
+        table = payload.get("table")
+        data = payload.get("data", {})
+        
+        print(f"[MQTT] Received {table} data from core: ID {data.get('id', 'unknown')}")
+        
+        asyncio.run_coroutine_threadsafe(
+            apply_core_update(
+                userdata["pool"],
+                table,
+                data
+            ),
+            userdata["loop"]
+        )
+    except Exception as e:
+        print(f"[MQTT] Error processing core message: {e}")
+        print(f"[MQTT] Message topic: {msg.topic}")
+        print(f"[MQTT] Message payload: {msg.payload.decode()}")
 
 # ---------------- MAIN ----------------
 async def main():
