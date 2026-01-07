@@ -15,12 +15,10 @@ CORE_DB_URL = "postgresql://postgres:postgres@localhost:5434/vis_db"
 MQTT_BROKER = "192.168.18.234"  # Same broker as edge
 MQTT_PORT = 1883
 
-CONFIG_TABLES = [
-    "cameras",
-    "advanced_rules",
-    "advanced_rulesets",
-    "rule_assignments",
-]
+# Only publish detection_alerts updates to edge when needed
+PUB_TOPICS = {
+    "detection_alerts": "core/to/edge/detection_alerts"
+}
 
 # Tables that have organization_id field
 TABLES_WITH_ORGANIZATION_ID = [
@@ -32,9 +30,8 @@ TABLES_WITH_ORGANIZATION_ID = [
 
 # Subscribe to all edge-to-core topics
 SUB_TOPICS = [
-    
     "edge/to/core/cameras",
-    "edge/to/core/advanced_rulesets",
+    "edge/to/core/advanced_rulesets", 
     "edge/to/core/advanced_rules",
     "edge/to/core/rule_assignments",
     "edge/to/core/detection_alerts",
@@ -42,40 +39,31 @@ SUB_TOPICS = [
 
 mqtt_client = mqtt.Client()
 
-last_sync = {}
-
 async def get_pool():
     return await asyncpg.create_pool(CORE_DB_URL)
 
-# ---------------- PUBLISH CONFIG ----------------
-async def publish_table(pool, table):
-    last_ts = last_sync.get(table, "1970-01-01")
-
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            f"""
-            SELECT * FROM {table}
-            """
-        )
-
-        print(f"[{table}] Publishing {len(rows)} records to edge")
+# ---------------- PUBLISH DETECTION ALERTS UPDATES ----------------
+async def publish_detection_alert_update(detection_alert_data):
+    """Publish detection alert updates to edge when alerts are modified in core"""
+    try:
+        message = json.dumps({
+            "table": "detection_alerts",
+            "op": "upsert", 
+            "data": detection_alert_data
+        }, cls=DateTimeEncoder)
         
-        for row in rows:
-            data = dict(row)
-            if "updated_at" in data:
-                last_sync[table] = data["updated_at"]
-
-            mqtt_client.publish(
-                f"core/to/edge/{table}",
-                json.dumps({
-                    "table": table,
-                    "op": "upsert",
-                    "data": data
-                }, cls=DateTimeEncoder),
-                qos=1
-            )
+        result = mqtt_client.publish(
+            PUB_TOPICS["detection_alerts"],
+            message,
+            qos=1
+        )
+        
+        print(f"[detection_alerts] Published update to edge for record ID {detection_alert_data.get('id', 'unknown')} - Result: {result.rc}")
+    except Exception as e:
+        print(f"[detection_alerts] Error publishing update to edge: {e}")
 
 # ---------------- APPLY EDGE DATA ----------------
+
 async def apply_edge_data(pool, table, data):
     try:
         # print(f"[{table}] Attempting to upsert data: {data}")
@@ -214,10 +202,12 @@ async def main():
         print(f"[MQTT] Subscribed to {topic}")
     
     mqtt_client.loop_start()
-
+    
+    print("[CORE] Service started - listening for edge data...")
+    print("[CORE] One-way sync: Edge -> Core (except detection_alerts can be updated from core)")
+    
+    # Keep the service running to receive messages
     while True:
-        for table in CONFIG_TABLES:
-            await publish_table(pool, table)
-        await asyncio.sleep(3)
+        await asyncio.sleep(10)  # Just keep alive, no periodic publishing
 
 asyncio.run(main())

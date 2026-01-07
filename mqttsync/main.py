@@ -1,0 +1,296 @@
+import os
+import json
+import asyncio
+import asyncpg
+import paho.mqtt.client as mqtt
+from datetime import datetime
+from typing import Dict, Any
+
+# =========================================================
+# ENV CONFIG
+# =========================================================
+CORE_DB_URL = os.environ["CORE_DB_URL"]
+MQTT_BROKER = os.environ["MQTT_BROKER"]
+MQTT_PORT = int(os.environ.get("MQTT_PORT", 1883))
+
+# =========================================================
+# CONSTANTS
+# =========================================================
+PUB_TOPICS = {
+    "cameras": "edge/to/core/cameras",
+    "advanced_rules": "edge/to/core/advanced_rules",
+    "advanced_rulesets": "edge/to/core/advanced_rulesets",
+    "rule_assignments": "edge/to/core/rule_assignments",
+    "detection_alerts": "edge/to/core/detection_alerts"
+}
+
+TABLES_WITH_ORGANIZATION_ID = {
+    "cameras",
+    "advanced_rules", 
+    "advanced_rulesets",
+    "rule_assignments"
+}
+
+SUB_TOPICS = [
+    "edge/to/core/cameras",
+    "edge/to/core/advanced_rulesets",
+    "edge/to/core/advanced_rules",
+    "edge/to/core/rule_assignments",
+    "edge/to/core/detection_alerts",
+]
+
+# Only allow detection_alerts updates from core to edge
+CORE_TO_EDGE_TOPICS = [
+    "core/to/edge/detection_alerts"
+]
+
+DATETIME_FIELDS = {
+    "created_at",
+    "updated_at",
+    "event_time",
+    "acknowledged_at",
+}
+
+last_seen_ids = {
+    "detection_alerts": 0,
+    "cameras": 0,
+    "advanced_rules": 0,
+    "advanced_rulesets": 0,
+    "rule_assignments": 0
+}
+
+# =========================================================
+# JSON ENCODER
+# =========================================================
+class DateTimeEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return super().default(obj)
+
+# =========================================================
+# DB
+# =========================================================
+async def get_pool():
+    return await asyncpg.create_pool(CORE_DB_URL, min_size=1, max_size=5)
+
+def parse_datetimes(data: Dict[str, Any]) -> Dict[str, Any]:
+    parsed = {}
+    for k, v in data.items():
+        if k in DATETIME_FIELDS and isinstance(v, str) and v:
+            try:
+                parsed[k] = datetime.fromisoformat(v.replace("Z", "+00:00"))
+            except ValueError:
+                parsed[k] = v
+        else:
+            parsed[k] = v
+    return parsed
+
+# =========================================================
+# MQTT
+# =========================================================
+mqtt_client = mqtt.Client()
+
+# =========================================================
+# EDGE → CORE (DATA PUBLISH)
+# =========================================================
+async def publish_table_data(pool, table_name: str):
+    global last_seen_ids
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT * FROM {table_name}
+            WHERE id > $1
+            ORDER BY id ASC
+            """,
+            last_seen_ids[table_name]
+        )
+
+        print(f"[{table_name}] Found {len(rows)} new records to sync (last_seen_id: {last_seen_ids[table_name]})")
+        
+        for row in rows:
+            payload = dict(row)
+            last_seen_ids[table_name] = row["id"]
+
+            message = {
+                "table": table_name,
+                "op": "upsert",
+                "data": payload
+            }
+            
+            result = mqtt_client.publish(
+                PUB_TOPICS[table_name],
+                json.dumps(message, cls=DateTimeEncoder),
+                qos=1
+            )
+            
+            print(f"[{table_name}] Published record ID {row['id']} to {PUB_TOPICS[table_name]} - Result: {result.rc}")
+
+# =========================================================
+# CORE → EDGE (DETECTION ALERTS ONLY)
+# =========================================================
+async def apply_core_update(pool, table: str, data: Dict[str, Any]):
+    # Only allow detection_alerts updates from core
+    if table != "detection_alerts":
+        print(f"[{table}] Ignoring core update - only detection_alerts updates are allowed")
+        return
+        
+    try:
+        print(f"[{table}] Received core update for record ID {data.get('id', 'unknown')}")
+        
+        processed = parse_datetimes(data)
+        
+        cols = ", ".join(processed.keys())
+        placeholders = ", ".join(f"${i+1}" for i in range(len(processed)))
+        updates = ", ".join(f"{k}=EXCLUDED.{k}" for k in processed.keys())
+
+        sql = f"""
+        INSERT INTO {table} ({cols})
+        VALUES ({placeholders})
+        ON CONFLICT (id) DO UPDATE SET
+        {updates}
+        """
+
+        async with pool.acquire() as conn:
+            await conn.execute(sql, *processed.values())
+            print(f"[{table}] Successfully applied core update for record ID {processed.get('id', 'unknown')}")
+            
+    except Exception as e:
+        print(f"[{table}] ERROR applying core update: {e}")
+        print(f"[{table}] Data that failed: {data}")
+
+# =========================================================
+# EDGE → CORE (DATA INGEST) 
+# =========================================================
+async def apply_edge_data(pool, table: str, data: Dict[str, Any]):
+    processed = parse_datetimes(data)
+
+    async with pool.acquire() as conn:
+        # ---- Resolve organization_id ----
+        if (
+            table in TABLES_WITH_ORGANIZATION_ID
+            and processed.get("edge_id")
+        ):
+            row = await conn.fetchrow(
+                "SELECT organization_id FROM edge_devices WHERE edge_id=$1",
+                processed["edge_id"],
+            )
+            if row:
+                processed["organization_id"] = row["organization_id"]
+
+        # ---- Detect existence ----
+        exists = False
+        if processed.get("id") and processed.get("edge_id"):
+            exists = await conn.fetchrow(
+                f"SELECT 1 FROM {table} WHERE id=$1 AND edge_id=$2",
+                processed["id"],
+                processed["edge_id"],
+            )
+        elif processed.get("id"):
+            exists = await conn.fetchrow(
+                f"SELECT 1 FROM {table} WHERE id=$1",
+                processed["id"],
+            )
+
+        # ---- Update ----
+        if exists:
+            update_data = {
+                k: v for k, v in processed.items()
+                if k not in {"id", "edge_id"}
+            }
+            if update_data:
+                set_clause = ", ".join(
+                    f"{k}=${i+3}" for i, k in enumerate(update_data)
+                )
+                if processed.get("edge_id"):
+                    sql = f"""
+                        UPDATE {table}
+                        SET {set_clause}
+                        WHERE id=$1 AND edge_id=$2
+                    """
+                    await conn.execute(
+                        sql,
+                        processed["id"],
+                        processed["edge_id"],
+                        *update_data.values(),
+                    )
+                else:
+                    sql = f"""
+                        UPDATE {table}
+                        SET {set_clause}
+                        WHERE id=$1
+                    """
+                    await conn.execute(
+                        sql,
+                        processed["id"],
+                        *update_data.values(),
+                    )
+        # ---- Insert ----
+        else:
+            cols = ", ".join(processed.keys())
+            placeholders = ", ".join(f"${i+1}" for i in range(len(processed)))
+            sql = f"INSERT INTO {table} ({cols}) VALUES ({placeholders})"
+            await conn.execute(sql, *processed.values())
+
+# =========================================================
+# MQTT CALLBACK
+# =========================================================
+def on_message(client, userdata, msg):
+    try:
+        payload = json.loads(msg.payload.decode())
+        table = payload["table"]
+        data = payload["data"]
+        
+        # Determine if this is from core or edge based on topic
+        if msg.topic.startswith("core/to/edge/"):
+            print(f"[MQTT] Received {table} data from core: ID {data.get('id', 'unknown')}")
+            asyncio.run_coroutine_threadsafe(
+                apply_core_update(userdata["pool"], table, data),
+                userdata["loop"],
+            )
+        elif msg.topic.startswith("edge/to/core/"):
+            # This would be for when running as core service
+            asyncio.run_coroutine_threadsafe(
+                apply_edge_data(userdata["pool"], table, data),
+                userdata["loop"],
+            )
+    except Exception as e:
+        print(f"[MQTT ERROR] {e}")
+
+# =========================================================
+# MAIN LOOP
+# =========================================================
+async def main():
+    pool = await get_pool()
+    loop = asyncio.get_running_loop()
+
+    mqtt_client.user_data_set({"pool": pool, "loop": loop})
+    mqtt_client.on_message = on_message
+    mqtt_client.connect(MQTT_BROKER, MQTT_PORT)
+
+    # Subscribe to edge-to-core topics (if running as core)
+    for topic in SUB_TOPICS:
+        mqtt_client.subscribe(topic, qos=1)
+        print(f"[MQTT] Subscribed: {topic}")
+    
+    # Subscribe to core-to-edge detection_alerts (if running as edge)
+    for topic in CORE_TO_EDGE_TOPICS:
+        mqtt_client.subscribe(topic, qos=1)
+        print(f"[MQTT] Subscribed: {topic}")
+
+    mqtt_client.loop_start()
+    
+    print("[SERVICE] Started - One-way sync: Edge -> Core (except detection_alerts can be updated from core)")
+
+    # Publish edge data to core (edge-side behavior)
+    while True:
+        for table_name in PUB_TOPICS.keys():
+            await publish_table_data(pool, table_name)
+        await asyncio.sleep(2)
+
+# =========================================================
+# ENTRY
+# =========================================================
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -12,21 +12,19 @@ class DateTimeEncoder(json.JSONEncoder):
         return super().default(obj)
 
 EDGE_DB_URL = "postgresql://postgres:postgres@localhost:5432/vis_db"
-MQTT_BROKER = "192.168.18.234"
+MQTT_BROKER = "34.18.159.205"
 MQTT_PORT = 1883
 
 PUB_TOPICS = {
-    "detection_alerts": "edge/to/core/detection_alerts",
+    
     "cameras": "edge/to/core/cameras",
     "advanced_rules": "edge/to/core/advanced_rules",
     "advanced_rulesets": "edge/to/core/advanced_rulesets",
-    "rule_assignments": "edge/to/core/rule_assignments"
+    "rule_assignments": "edge/to/core/rule_assignments",
+    "detection_alerts": "edge/to/core/detection_alerts"
 }
 SUB_TOPICS = [
-    "core/to/edge/cameras",
-    "core/to/edge/advanced_rulesets",
-    "core/to/edge/advanced_rules",
-    "core/to/edge/rule_assignments",
+    "core/to/edge/detection_alerts",  # Only allow detection_alerts updates from core
 ]
 
 last_seen_ids = {
@@ -95,6 +93,11 @@ async def publish_rule_assignments(pool):
 
 # ---------------- APPLY CORE UPDATES ----------------
 async def apply_core_update(pool, table, data):
+    # Only allow detection_alerts updates from core
+    if table != "detection_alerts":
+        print(f"[{table}] Ignoring core update - only detection_alerts updates are allowed")
+        return
+        
     try:
         print(f"[{table}] Received core update for record ID {data.get('id', 'unknown')}")
         
