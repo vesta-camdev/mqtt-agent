@@ -12,8 +12,8 @@ class DateTimeEncoder(json.JSONEncoder):
         return super().default(obj)
 
 EDGE_DB_URL = os.getenv("EDGE_DB_URL", "postgresql://postgres:postgres@localhost:5432/vis_db")
-MQTT_BROKER = os.getenv("MQTT_BROKER", "34.18.211.31")
-MQTT_PORT = int(os.getenv("MQTT_PORT", 8883))
+MQTT_BROKER = os.getenv("MQTT_BROKER", "192.168.18.234")
+MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
 
 PUB_TOPICS = {
     
@@ -64,12 +64,7 @@ async def initialize_last_seen_ids(pool):
 
 # ---------------- MQTT ----------------
 mqtt_client = mqtt.Client()
-mqtt_client.tls_set(
-    ca_certs="/etc/mosquitto/certs/mqtt-client-test.chain.crt",
-    certfile="/etc/mosquitto/certs/mqtt-client-test.crt",
-    keyfile="/etc/mosquitto/certs/mqtt-client-test.private.pem",
-)
-mqtt_client.tls_insecure_set(False)   
+
 # ---------------- DB ----------------
 async def get_pool():
     return await asyncpg.create_pool(EDGE_DB_URL)
@@ -221,7 +216,7 @@ async def main():
     mqtt_client.user_data_set({"pool": pool, "loop": loop})
     mqtt_client.on_message = on_message
     mqtt_client.connect(MQTT_BROKER, MQTT_PORT)
-   
+    
     for t in SUB_TOPICS:
         mqtt_client.subscribe(t, qos=1)
         print(f"[MAIN] Subscribed to: {t}")

@@ -10,8 +10,8 @@ from typing import Dict, Any
 # ENV CONFIG
 # =========================================================
 CORE_DB_URL="postgresql://postgres:7heC%40mCorE@10.15.160.6:5432/postgres"
-MQTT_BROKER="34.18.125.154"
-MQTT_PORT=1883
+MQTT_BROKER="34.18.211.31"
+MQTT_PORT=8883
 # =========================================================
 # CONSTANTS
 # =========================================================
@@ -73,7 +73,12 @@ def parse_datetimes(data: Dict[str, Any]) -> Dict[str, Any]:
 # MQTT
 # =========================================================
 mqtt_client = mqtt.Client()
-
+mqtt_client.tls_set(
+    ca_certs="/etc/mosquitto/certs/ca.crt",
+    certfile="/etc/mosquitto/certs/broker.crt",
+    keyfile="/etc/mosquitto/certs/broker.key",
+)
+mqtt_client.tls_insecure_set(False)
 # =========================================================
 # CORE → EDGE (DETECTION ALERTS ONLY)
 # =========================================================
