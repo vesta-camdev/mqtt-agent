@@ -283,6 +283,24 @@ async def apply_edge_data(pool, table: str, data: Dict[str, Any]):
                             f"[{table}] FK violation for ID {record_id} — "
                             "dependencies not yet synced, will retry"
                         )
+                        print(f"[{table}] FK Error details: {insert_error}")
+                        print(f"[{table}] Data being inserted: {processed}")
+                        
+                        # Check if referenced records exist
+                        if table == "cameras" and processed.get("edge_id"):
+                            edge_exists = await conn.fetchrow(
+                                "SELECT edge_id, organization_id FROM edge_devices WHERE edge_id=$1",
+                                processed["edge_id"]
+                            )
+                            print(f"[{table}] Edge device exists: {edge_exists}")
+                            
+                            if processed.get("organization_id"):
+                                org_exists = await conn.fetchrow(
+                                    "SELECT id FROM organizations WHERE id=$1",
+                                    processed["organization_id"]
+                                )
+                                print(f"[{table}] Organization exists: {org_exists}")
+                        
                         return
                     raise
 

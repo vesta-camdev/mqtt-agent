@@ -1,213 +1,376 @@
-import asyncio
+import os
 import json
+import asyncio
 import asyncpg
 import paho.mqtt.client as mqtt
 from datetime import datetime
+from typing import Dict, Any
 
-# Custom JSON encoder to handle datetime objects
+# =========================================================
+# ENV CONFIG
+# =========================================================
+CORE_DB_URL = "postgresql://postgres:postgres@localhost:5434/vis_core_db"
+MQTT_BROKER = "192.168.18.234"  # Same broker as edge
+MQTT_PORT = 1883
+# =========================================================
+# CONSTANTS
+# =========================================================
+TABLES_WITH_ORGANIZATION_ID = {
+    "cameras",
+    "advanced_rules", 
+    "advanced_rulesets",
+    "rule_assignments"
+}
+
+SUB_TOPICS = [
+    "edge/to/core/cameras",
+    "edge/to/core/advanced_rulesets",
+    "edge/to/core/advanced_rules",
+    "edge/to/core/rule_assignments",
+    "edge/to/core/detection_alerts",
+]
+
+# Only allow detection_alerts updates from core to edge
+CORE_TO_EDGE_TOPICS = [
+    "core/to/edge/detection_alerts"
+]
+
+DATETIME_FIELDS = {
+    "created_at",
+    "updated_at",
+    "event_time",
+    "acknowledged_at",
+}
+
+# =========================================================
+# JSON ENCODER
+# =========================================================
 class DateTimeEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, datetime):
             return obj.isoformat()
         return super().default(obj)
 
-CORE_DB_URL = "postgresql://postgres:postgres@localhost:5434/vis_db"
-MQTT_BROKER = "192.168.18.234"  # Same broker as edge
-MQTT_PORT = 1883
-
-# Only publish detection_alerts updates to edge when needed
-PUB_TOPICS = {
-    "detection_alerts": "core/to/edge/detection_alerts"
-}
-
-# Tables that have organization_id field
-TABLES_WITH_ORGANIZATION_ID = [
-    "cameras",
-    "advanced_rules", 
-    "advanced_rulesets",
-    "rule_assignments"
-]
-
-# Subscribe to all edge-to-core topics
-SUB_TOPICS = [
-    "edge/to/core/cameras",
-    "edge/to/core/advanced_rulesets", 
-    "edge/to/core/advanced_rules",
-    "edge/to/core/rule_assignments",
-    "edge/to/core/detection_alerts",
-]
-
-mqtt_client = mqtt.Client()
-
+# =========================================================
+# DB
+# =========================================================
 async def get_pool():
-    return await asyncpg.create_pool(CORE_DB_URL)
+    return await asyncpg.create_pool(CORE_DB_URL, min_size=1, max_size=5)
 
-# ---------------- PUBLISH DETECTION ALERTS UPDATES ----------------
-async def publish_detection_alert_update(detection_alert_data):
-    """Publish detection alert updates to edge when alerts are modified in core"""
+def parse_datetimes(data: Dict[str, Any]) -> Dict[str, Any]:
+    parsed = {}
+    for k, v in data.items():
+        if k in DATETIME_FIELDS and isinstance(v, str) and v:
+            try:
+                parsed[k] = datetime.fromisoformat(v.replace("Z", "+00:00"))
+            except ValueError:
+                parsed[k] = v
+        else:
+            parsed[k] = v
+    return parsed
+
+# =========================================================
+# MQTT
+# =========================================================
+mqtt_client = mqtt.Client()
+# =========================================================
+# CORE → EDGE (DETECTION ALERTS ONLY)
+# =========================================================
+async def apply_core_update(pool, table: str, data: Dict[str, Any]):
+    # Only allow detection_alerts updates from core
+    if table != "detection_alerts":
+        print(f"[{table}] Ignoring core update - only detection_alerts updates are allowed")
+        return
+        
     try:
-        message = json.dumps({
-            "table": "detection_alerts",
-            "op": "upsert", 
-            "data": detection_alert_data
-        }, cls=DateTimeEncoder)
+        print(f"[{table}] Received core update for record ID {data.get('id', 'unknown')}")
         
-        result = mqtt_client.publish(
-            PUB_TOPICS["detection_alerts"],
-            message,
-            qos=1
-        )
+        processed = parse_datetimes(data)
         
-        print(f"[detection_alerts] Published update to edge for record ID {detection_alert_data.get('id', 'unknown')} - Result: {result.rc}")
-    except Exception as e:
-        print(f"[detection_alerts] Error publishing update to edge: {e}")
+        cols = ", ".join(processed.keys())
+        placeholders = ", ".join(f"${i+1}" for i in range(len(processed)))
+        updates = ", ".join(f"{k}=EXCLUDED.{k}" for k in processed.keys())
 
-# ---------------- APPLY EDGE DATA ----------------
+        sql = f"""
+        INSERT INTO {table} ({cols})
+        VALUES ({placeholders})
+        ON CONFLICT (id) DO UPDATE SET
+        {updates}
+        """
 
-async def apply_edge_data(pool, table, data):
-    try:
-        # print(f"[{table}] Attempting to upsert data: {data}")
-        
-        # Convert ISO datetime strings back to datetime objects
-        processed_data = {}
-        datetime_fields = ['created_at', 'updated_at', 'event_time', 'acknowledged_at']
-        
-        for key, value in data.items():
-            if key in datetime_fields and isinstance(value, str) and value:
-                try:
-                    # Parse ISO format datetime string back to datetime object
-                    processed_data[key] = datetime.fromisoformat(value.replace('Z', '+00:00'))
-                except ValueError:
-                    processed_data[key] = value
-            else:
-                processed_data[key] = value
-        
         async with pool.acquire() as conn:
-            # Fetch organization_id from edge_devices table if edge_id is present
-            # and only for tables that have organization_id field
-            if ('edge_id' in processed_data and processed_data['edge_id'] and 
-                table in TABLES_WITH_ORGANIZATION_ID):
-                try:
-                    edge_device = await conn.fetchrow(
-                        "SELECT organization_id FROM edge_devices WHERE edge_id = $1", 
-                        processed_data['edge_id']
-                    )
-                    if edge_device and edge_device['organization_id']:
-                        processed_data['organization_id'] = edge_device['organization_id']
-                        # print(f"[{table}] Fetched organization_id: {edge_device['organization_id']} for edge_id: {processed_data['edge_id']}")
-                    else:
-                        print(f"[{table}] WARNING: No organization_id found for edge_id: {processed_data['edge_id']}")
-                except Exception as e:
-                    print(f"[{table}] ERROR fetching organization_id: {e}")
-            elif table not in TABLES_WITH_ORGANIZATION_ID:
-                print(f"[{table}] Table does not have organization_id field, skipping organization lookup")
+            await conn.execute(sql, *processed.values())
+            print(f"[{table}] Successfully applied core update for record ID {processed.get('id', 'unknown')}")
             
-            # Check if record exists by trying to find it with id and edge_id (if both present)
-            record_exists = False
-            if 'id' in processed_data and 'edge_id' in processed_data:
-                try:
-                    existing = await conn.fetchrow(
-                        f"SELECT 1 FROM {table} WHERE id = $1 AND edge_id = $2", 
-                        processed_data['id'], processed_data['edge_id']
-                    )
-                    record_exists = existing is not None
-                except:
-                    record_exists = False
-            elif 'id' in processed_data:
-                try:
-                    existing = await conn.fetchrow(f"SELECT 1 FROM {table} WHERE id = $1", processed_data['id'])
-                    record_exists = existing is not None
-                except:
-                    record_exists = False
-            
-            if record_exists:
-                # Update existing record
-                print(f"[{table}] Record exists, updating...")
-                
-                # Build UPDATE statement (exclude id and edge_id from SET clause)
-                update_data = {k: v for k, v in processed_data.items() if k not in ['id', 'edge_id']}
-                if update_data:  # Only update if there are fields other than id/edge_id
-                    set_clauses = ", ".join(f"{k} = ${i+3}" for i, k in enumerate(update_data.keys()))
-                    
-                    if 'edge_id' in processed_data:
-                        update_sql = f"UPDATE {table} SET {set_clauses} WHERE id = $1 AND edge_id = $2"
-                        await conn.execute(update_sql, processed_data['id'], processed_data['edge_id'], *update_data.values())
-                    else:
-                        update_sql = f"UPDATE {table} SET {set_clauses} WHERE id = $1"
-                        await conn.execute(update_sql, processed_data['id'], *update_data.values())
-                    
-                    print(f"[{table}] Successfully updated record ID {processed_data.get('id', 'unknown')}")
-                else:
-                    print(f"[{table}] No fields to update besides id/edge_id")
-                    
-            else:
-                # Insert new record
-                print(f"[{table}] Record doesn't exist, inserting...")
-                
-                cols = ", ".join(processed_data.keys())
-                placeholders = ", ".join(f"${i+1}" for i in range(len(processed_data)))
-                
-                insert_sql = f"INSERT INTO {table} ({cols}) VALUES ({placeholders})"
-                await conn.execute(insert_sql, *processed_data.values())
-                print(f"[{table}] Successfully inserted new record ID {processed_data.get('id', 'unknown')}")
-            
-            # Verify the record exists (using id and edge_id if both present)
-            if 'id' in processed_data:
-                if 'edge_id' in processed_data:
-                    verify_result = await conn.fetchrow(
-                        f"SELECT id FROM {table} WHERE id = $1 AND edge_id = $2", 
-                        processed_data.get('id'), processed_data.get('edge_id')
-                    )
-                else:
-                    verify_result = await conn.fetchrow(f"SELECT id FROM {table} WHERE id = $1", processed_data.get('id'))
-                
-                if verify_result:
-                    print(f"[{table}] Verified: Record ID {processed_data.get('id')} exists in database")
-                else:
-                    print(f"[{table}] WARNING: Record ID {processed_data.get('id')} not found after operation!")
-            else:
-                print(f"[{table}] No id field to verify, operation completed")
-                
     except Exception as e:
-        pass
+        print(f"[{table}] ERROR applying core update: {e}")
+        print(f"[{table}] Data that failed: {data}")
 
-# ---------------- MQTT HANDLER ----------------
+# =========================================================
+# EDGE → CORE (DATA INGEST) 
+# =========================================================
+async def apply_edge_data(pool, table: str, data: Dict[str, Any]):
+    try:
+        processed = parse_datetimes(data)
+        record_id = processed.get("id", "unknown")
+        print(f"[{table}] Processing edge data for record ID {record_id}")
+
+        # --------------------------------------------------
+        # ---- Schema fixes ----
+        # --------------------------------------------------
+        schema_fixes = {
+            "advanced_rulesets": ["camera_id"],
+            "advanced_rules": [],
+            "rule_assignments": [],
+            "cameras": [],
+            "detection_alerts": [],
+        }
+
+        if table in schema_fixes:
+            for field in schema_fixes[table]:
+                processed.pop(field, None)
+
+        async with pool.acquire() as conn:
+
+            # --------------------------------------------------
+            # ---- Resolve organization_id ----
+            # --------------------------------------------------
+            if table in TABLES_WITH_ORGANIZATION_ID and processed.get("edge_id"):
+                row = await conn.fetchrow(
+                    "SELECT organization_id FROM edge_devices WHERE edge_id=$1",
+                    processed["edge_id"],
+                )
+                if row:
+                    processed["organization_id"] = row["organization_id"]
+
+            # --------------------------------------------------
+            # ---- Detect existence ----
+            # --------------------------------------------------
+            exists = False
+            existing_core = None
+
+            if processed.get("id") and processed.get("edge_id"):
+                if table == "detection_alerts":
+                    existing_core = await conn.fetchrow(
+                        """
+                        SELECT acknowledged
+                        FROM detection_alerts
+                        WHERE id=$1 AND edge_id=$2
+                        """,
+                        processed["id"],
+                        processed["edge_id"],
+                    )
+                else:
+                    existing_core = await conn.fetchrow(
+                        f"""
+                        SELECT 1
+                        FROM {table}
+                        WHERE id=$1 AND edge_id=$2
+                        """,
+                        processed["id"],
+                        processed["edge_id"],
+                    )
+                exists = bool(existing_core)
+
+            elif processed.get("id"):
+                if table == "detection_alerts":
+                    existing_core = await conn.fetchrow(
+                        """
+                        SELECT acknowledged
+                        FROM detection_alerts
+                        WHERE id=$1
+                        """,
+                        processed["id"],
+                    )
+                else:
+                    existing_core = await conn.fetchrow(
+                        f"""
+                        SELECT 1
+                        FROM {table}
+                        WHERE id=$1
+                        """,
+                        processed["id"],
+                    )
+                exists = bool(existing_core)
+
+            # --------------------------------------------------
+            # 🔒 CORE AUTHORITY GUARD (detection_alerts ONLY)
+            # --------------------------------------------------
+            if table == "detection_alerts" and exists:
+                edge_ack = processed.get("acknowledged")
+                core_ack = existing_core["acknowledged"]
+
+                if edge_ack != core_ack:
+                    print(
+                        f"[detection_alerts] CORE owns acknowledgment. "
+                        f"Ignoring EDGE UPDATE for ID {processed['id']} "
+                        f"(EDGE={edge_ack}, CORE={core_ack})"
+                    )
+                    return  # ❌ block update only
+
+            # --------------------------------------------------
+            # ---- UPDATE ----
+            # --------------------------------------------------
+            if exists:
+                print(f"[{table}] Record exists, updating ID {record_id}")
+
+                if table == "detection_alerts":
+                    update_data = {
+                        k: v for k, v in processed.items()
+                        if k not in {
+                            "id",
+                            "edge_id",
+                            "acknowledged",
+                            "acknowledged_at",
+                        }
+                    }
+                else:
+                    update_data = {
+                        k: v for k, v in processed.items()
+                        if k not in {"id", "edge_id"}
+                    }
+
+                if update_data:
+                    set_clause = ", ".join(
+                        f"{k}=${i+3}" for i, k in enumerate(update_data)
+                    )
+
+                    if processed.get("edge_id"):
+                        sql = f"""
+                            UPDATE {table}
+                            SET {set_clause}
+                            WHERE id=$1 AND edge_id=$2
+                        """
+                        await conn.execute(
+                            sql,
+                            processed["id"],
+                            processed["edge_id"],
+                            *update_data.values(),
+                        )
+                    else:
+                        sql = f"""
+                            UPDATE {table}
+                            SET {set_clause}
+                            WHERE id=$1
+                        """
+                        await conn.execute(
+                            sql,
+                            processed["id"],
+                            *update_data.values(),
+                        )
+
+            # --------------------------------------------------
+            # ---- INSERT ----
+            # --------------------------------------------------
+            else:
+                print(f"[{table}] Inserting new record ID {record_id}")
+
+                cols = ", ".join(processed.keys())
+                placeholders = ", ".join(f"${i+1}" for i in range(len(processed)))
+                sql = f"INSERT INTO {table} ({cols}) VALUES ({placeholders})"
+
+                try:
+                    await conn.execute(sql, *processed.values())
+                except Exception as insert_error:
+                    if "foreign key constraint" in str(insert_error).lower():
+                        print(
+                            f"[{table}] FK violation for ID {record_id} — "
+                            "dependencies not yet synced, will retry"
+                        )
+                        return
+                    raise
+
+    except Exception as e:
+        print(f"[{table}] ERROR in apply_edge_data: {e}")
+        print(f"[{table}] Data that failed: {data}")
+        import traceback
+        traceback.print_exc()
+
+# =========================================================
+# MQTT CALLBACK
+# =========================================================
 def on_message(client, userdata, msg):
     try:
+        print(f"[MQTT] Received message on topic: {msg.topic}")
         payload = json.loads(msg.payload.decode())
-        table = payload.get("table")
-        data = payload.get("data", {})
+        table = payload["table"]
+        data = payload["data"]
         
-        # print(f"[MQTT] Received {table} data: ID {data.get('id', 'unknown')}")
+        print(f"[MQTT] Processing {table} data - ID: {data.get('id', 'unknown')}, Size: {len(str(payload))} chars")
         
-        asyncio.run_coroutine_threadsafe(
-            apply_edge_data(userdata["pool"], table, data),
-            userdata["loop"]
-        )
+        # Determine if this is from core or edge based on topic
+        if msg.topic.startswith("core/to/edge/"):
+            print(f"[MQTT] Received {table} data from core: ID {data.get('id', 'unknown')}")
+            asyncio.run_coroutine_threadsafe(
+                apply_core_update(userdata["pool"], table, data),
+                userdata["loop"],
+            )
+        elif msg.topic.startswith("edge/to/core/"):
+            print(f"[MQTT] Received {table} data from edge: ID {data.get('id', 'unknown')}")
+            # This would be for when running as core service
+            asyncio.run_coroutine_threadsafe(
+                apply_edge_data(userdata["pool"], table, data),
+                userdata["loop"],
+            )
+        else:
+            print(f"[MQTT] Unknown topic pattern: {msg.topic}")
+            
+    except json.JSONDecodeError as e:
+        print(f"[MQTT ERROR] JSON decode error: {e}")
+        print(f"[MQTT ERROR] Raw payload: {msg.payload.decode()}")
+    except KeyError as e:
+        print(f"[MQTT ERROR] Missing key in payload: {e}")
+        print(f"[MQTT ERROR] Payload: {msg.payload.decode()}")
     except Exception as e:
-        print(f"[MQTT] Error processing message: {e}")
+        print(f"[MQTT ERROR] Unexpected error: {e}")
+        print(f"[MQTT ERROR] Topic: {msg.topic}")
+        print(f"[MQTT ERROR] Payload: {msg.payload.decode()}")
+        import traceback
+        traceback.print_exc()
 
-# ---------------- MAIN ----------------
+# =========================================================
+# MAIN LOOP
+# =========================================================
 async def main():
+    print("[SERVICE] Starting MQTT Sync Service...")
+    
     pool = await get_pool()
+    print("[SERVICE] Database connection established")
+    
     loop = asyncio.get_running_loop()
 
     mqtt_client.user_data_set({"pool": pool, "loop": loop})
     mqtt_client.on_message = on_message
     mqtt_client.connect(MQTT_BROKER, MQTT_PORT)
-    
-    # Subscribe to all edge-to-core topics
+    print(f"[SERVICE] Connected to MQTT broker: {MQTT_BROKER}:{MQTT_PORT}")
+
+    # Subscribe to edge-to-core topics (if running as core)
     for topic in SUB_TOPICS:
         mqtt_client.subscribe(topic, qos=1)
-        print(f"[MQTT] Subscribed to {topic}")
+        print(f"[MQTT] Subscribed: {topic}")
     
+    # Subscribe to core-to-edge detection_alerts (if running as edge)
+    for topic in CORE_TO_EDGE_TOPICS:
+        mqtt_client.subscribe(topic, qos=1)
+        print(f"[MQTT] Subscribed: {topic}")
+
     mqtt_client.loop_start()
     
-    print("[CORE] Service started - listening for edge data...")
-    print("[CORE] One-way sync: Edge -> Core (except detection_alerts can be updated from core)")
-    
-    # Keep the service running to receive messages
-    while True:
-        await asyncio.sleep(10)  # Just keep alive, no periodic publishing
+    print("[SERVICE] Started - Core service ready to receive data from edge")
+    print("[SERVICE] Waiting for edge data...")
 
-asyncio.run(main())
+    # Keep the service running to receive edge data
+    try:
+        while True:
+            await asyncio.sleep(30)  # Just keep alive, all work is done by MQTT callbacks
+    except KeyboardInterrupt:
+        print("[SERVICE] Shutting down...")
+    finally:
+        mqtt_client.loop_stop()
+        await pool.close()
+
+# =========================================================
+# ENTRY
+# =========================================================
+if __name__ == "__main__":
+    asyncio.run(main())

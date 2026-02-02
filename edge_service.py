@@ -12,7 +12,7 @@ class DateTimeEncoder(json.JSONEncoder):
         return super().default(obj)
 
 EDGE_DB_URL = os.getenv("EDGE_DB_URL", "postgresql://postgres:postgres@localhost:5432/vis_db")
-MQTT_BROKER = os.getenv("MQTT_BROKER", "34.18.211.31")
+MQTT_BROKER = os.getenv("MQTT_BROKER", "api.doh.camnitive.ai")
 MQTT_PORT = int(os.getenv("MQTT_PORT", 8883))
 
 PUB_TOPICS = {
@@ -65,9 +65,9 @@ async def initialize_last_seen_ids(pool):
 # ---------------- MQTT ----------------
 mqtt_client = mqtt.Client()
 mqtt_client.tls_set(
-    ca_certs="/etc/mosquitto/certs/mqtt-client-test.chain.crt",
-    certfile="/etc/mosquitto/certs/mqtt-client-test.crt",
-    keyfile="/etc/mosquitto/certs/mqtt-client-test.private.pem",
+    ca_certs="/etc/mosquitto/certs/serverca1.crt",
+    certfile="/etc/mosquitto/certs/mqtt-client-c1.crt",
+    keyfile="/etc/mosquitto/certs/mqtt-client-c1.private.pem",
 )
 mqtt_client.tls_insecure_set(False)   
 # ---------------- DB ----------------
