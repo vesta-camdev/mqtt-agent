@@ -10,7 +10,7 @@ from typing import Dict, Any
 # ENV CONFIG
 # =========================================================
 CORE_DB_URL="postgresql://postgres:7heC%40mCorE@10.15.160.6:5432/postgres"
-MQTT_BROKER="34.18.211.31"
+MQTT_BROKER="api.doh.camnitive.ai"
 MQTT_PORT=8883
 # =========================================================
 # CONSTANTS
@@ -34,6 +34,11 @@ SUB_TOPICS = [
 CORE_TO_EDGE_TOPICS = [
     "core/to/edge/detection_alerts"
 ]
+
+# Topics for publishing from core to edge
+PUB_TOPICS = {
+    "detection_alerts": "core/to/edge/detection_alerts"
+}
 
 DATETIME_FIELDS = {
     "created_at",
@@ -74,11 +79,43 @@ def parse_datetimes(data: Dict[str, Any]) -> Dict[str, Any]:
 # =========================================================
 mqtt_client = mqtt.Client()
 mqtt_client.tls_set(
-    ca_certs="/etc/mosquitto/certs/ca.crt",
-    certfile="/etc/mosquitto/certs/broker.crt",
-    keyfile="/etc/mosquitto/certs/broker.key",
+    ca_certs="/home/saif/core_syncagent/certfiles/serverca1.crt",
+    certfile="/home/saif/core_syncagent/certfiles/core-client.crt",
+    keyfile="/home/saif/core_syncagent/certfiles/core-client.private.pem",
 )
 mqtt_client.tls_insecure_set(False)
+# =========================================================
+# CORE → EDGE PUBLISHING
+# =========================================================
+async def publish_to_edge(table: str, data: Dict[str, Any]):
+    """Publish detection_alerts updates from core back to edge"""
+    if table != "detection_alerts":
+        return
+        
+    try:
+        message = json.dumps(
+            {
+                "table": table,
+                "op": "update",
+                "data": data,
+            },
+            cls=DateTimeEncoder,
+        )
+        
+        result = mqtt_client.publish(
+            PUB_TOPICS[table],
+            message,
+            qos=1,
+        )
+        
+        if result.rc == 0:
+            print(f"[{table}] Published update to edge for ID {data.get('id', 'unknown')}")
+        else:
+            print(f"[{table}] Failed to publish to edge for ID {data.get('id', 'unknown')}")
+            
+    except Exception as e:
+        print(f"[{table}] ERROR publishing to edge: {e}")
+
 # =========================================================
 # CORE → EDGE (DETECTION ALERTS ONLY)
 # =========================================================
@@ -311,6 +348,82 @@ async def apply_edge_data(pool, table: str, data: Dict[str, Any]):
         traceback.print_exc()
 
 # =========================================================
+# PERIODIC CORE → EDGE SYNC
+# =========================================================
+async def sync_core_updates_to_edge(pool):
+    """Periodically sync detection_alerts updates from core back to edge"""
+    try:
+        async with pool.acquire() as conn:
+            # Find detection_alerts that have been updated in the last 5 minutes
+            # and have acknowledgment changes
+            rows = await conn.fetch(
+                """
+                SELECT *
+                FROM detection_alerts
+                WHERE updated_at >= NOW() - INTERVAL '5 minutes'
+                AND (acknowledged IS NOT NULL OR acknowledged_at IS NOT NULL)
+                ORDER BY updated_at DESC
+                LIMIT 50
+                """
+            )
+            
+            for row in rows:
+                data = dict(row)
+                await publish_to_edge("detection_alerts", data)
+                
+    except Exception as e:
+        print(f"[CORE_SYNC] Error syncing core updates to edge: {e}")
+
+# =========================================================
+# MANUAL ACKNOWLEDGMENT TRIGGER
+# =========================================================
+async def trigger_acknowledgment_update(pool, alert_id: int, acknowledged: bool, edge_id: str = None):
+    """Manually trigger acknowledgment update and publish to edge"""
+    try:
+        async with pool.acquire() as conn:
+            # Update acknowledgment in core database
+            acknowledged_at = datetime.utcnow() if acknowledged else None
+            
+            if edge_id:
+                await conn.execute(
+                    """
+                    UPDATE detection_alerts 
+                    SET acknowledged=$1, acknowledged_at=$2, updated_at=NOW()
+                    WHERE id=$3 AND edge_id=$4
+                    """,
+                    acknowledged, acknowledged_at, alert_id, edge_id
+                )
+            else:
+                await conn.execute(
+                    """
+                    UPDATE detection_alerts 
+                    SET acknowledged=$1, acknowledged_at=$2, updated_at=NOW()
+                    WHERE id=$3
+                    """,
+                    acknowledged, acknowledged_at, alert_id
+                )
+            
+            # Fetch updated record and publish to edge
+            if edge_id:
+                updated_row = await conn.fetchrow(
+                    "SELECT * FROM detection_alerts WHERE id=$1 AND edge_id=$2",
+                    alert_id, edge_id
+                )
+            else:
+                updated_row = await conn.fetchrow(
+                    "SELECT * FROM detection_alerts WHERE id=$1",
+                    alert_id
+                )
+            
+            if updated_row:
+                data = dict(updated_row)
+                await publish_to_edge("detection_alerts", data)
+                print(f"[MANUAL_ACK] Triggered acknowledgment update for alert ID {alert_id}")
+                
+    except Exception as e:
+        print(f"[MANUAL_ACK] Error triggering acknowledgment update: {e}")
+
+# =========================================================
 # MQTT CALLBACK
 # =========================================================
 def on_message(client, userdata, msg):
@@ -383,10 +496,11 @@ async def main():
     print("[SERVICE] Started - Core service ready to receive data from edge")
     print("[SERVICE] Waiting for edge data...")
 
-    # Keep the service running to receive edge data
+    # Keep the service running and periodically sync core updates back to edge
     try:
         while True:
-            await asyncio.sleep(30)  # Just keep alive, all work is done by MQTT callbacks
+            await asyncio.sleep(30)  # Wait 30 seconds
+            await sync_core_updates_to_edge(pool)  # Sync any core updates back to edge
     except KeyboardInterrupt:
         print("[SERVICE] Shutting down...")
     finally:
