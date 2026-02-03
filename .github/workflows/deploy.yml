@@ -1,0 +1,33 @@
+name: Deploy MQTT Agent
+
+on:
+  push:
+    branches:
+      - main   # change if needed
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.VM_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Deploy code to VM
+        run: |
+          rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='env' \
+            ./ ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/home/saif/mqtt-agent/
+
+      - name: Restart MQTT agent
+        run: |
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} \
+          "sudo systemctl restart mqtt-agent"
