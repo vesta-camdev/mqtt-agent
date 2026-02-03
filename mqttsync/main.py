@@ -5,7 +5,7 @@ import asyncpg
 import paho.mqtt.client as mqtt
 from datetime import datetime
 from typing import Dict, Any
-
+#new upload
 # =========================================================
 # ENV CONFIG
 # =========================================================
@@ -147,7 +147,7 @@ async def apply_core_update(pool, table: str, data: Dict[str, Any]):
             
     except Exception as e:
         print(f"[{table}] ERROR applying core update: {e}")
-        print(f"[{table}] Data that failed: {data}")
+        # print(f"[{table}] Data that failed: {data}")
 
 # =========================================================
 # EDGE → CORE (DATA INGEST) 
