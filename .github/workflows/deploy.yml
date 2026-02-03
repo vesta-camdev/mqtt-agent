@@ -25,9 +25,9 @@ jobs:
           rsync -avz --delete \
             --exclude='.git' \
             --exclude='env' \
-            ./ ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/home/saif/mqtt-agent/
+            ./ ${{ secrets.VM_USER }}@34.18.211.31:/home/saif/mqtt-agent/
 
       - name: Restart MQTT agent
         run: |
-          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} \
+          ssh ${{ secrets.VM_USER }}@34.18.211.31 \
           "sudo systemctl restart mqtt-agent"
