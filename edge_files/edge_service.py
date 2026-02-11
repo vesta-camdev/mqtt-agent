@@ -65,9 +65,9 @@ async def initialize_last_seen_ids(pool):
 # ---------------- MQTT ----------------
 mqtt_client = mqtt.Client()
 mqtt_client.tls_set(
-    ca_certs="certs/serverca1.crt",
-    certfile="certs/mqtt-client-c1.crt",
-    keyfile="certs/mqtt-client-c1.private.pem",
+    ca_certs="../certs/serverca1.crt",
+    certfile="../certs/mqtt-client-c1.crt",
+    keyfile="../certs/mqtt-client-c1.private.pem",
 )
 mqtt_client.tls_insecure_set(False)   
 # ---------------- DB ----------------
