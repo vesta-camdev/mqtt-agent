@@ -165,7 +165,7 @@ async def apply_edge_data(pool, table: str, data: Dict[str, Any]):
             "advanced_rulesets": ["camera_id"],
             "advanced_rules": [],
             "rule_assignments": [],
-            "cameras": [],
+            "cameras": ["input_size"],
             "detection_alerts": [],
         }
 
@@ -185,6 +185,9 @@ async def apply_edge_data(pool, table: str, data: Dict[str, Any]):
                 )
                 if row:
                     processed["organization_id"] = row["organization_id"]
+                else:
+                    print(f"[{table}] No organization_id found for edge_id {processed['edge_id']}, skipping record ID {record_id}")
+                    return  # Skip this record if no organization found
 
             # --------------------------------------------------
             # ---- Detect existence ----
@@ -192,47 +195,52 @@ async def apply_edge_data(pool, table: str, data: Dict[str, Any]):
             exists = False
             existing_core = None
 
-            if processed.get("id") and processed.get("edge_id"):
+            # Check if record exists with matching id, edge_id, and created_at
+            if processed.get("id") and processed.get("edge_id") and processed.get("created_at"):
                 if table == "detection_alerts":
                     existing_core = await conn.fetchrow(
                         """
                         SELECT acknowledged
                         FROM detection_alerts
-                        WHERE id=$1 AND edge_id=$2
+                        WHERE id=$1 AND edge_id=$2 AND created_at=$3
                         """,
                         processed["id"],
                         processed["edge_id"],
+                        processed["created_at"],
                     )
                 else:
                     existing_core = await conn.fetchrow(
                         f"""
                         SELECT 1
                         FROM {table}
-                        WHERE id=$1 AND edge_id=$2
+                        WHERE id=$1 AND edge_id=$2 AND created_at=$3
                         """,
                         processed["id"],
                         processed["edge_id"],
+                        processed["created_at"],
                     )
                 exists = bool(existing_core)
 
-            elif processed.get("id"):
+            elif processed.get("id") and processed.get("created_at"):
                 if table == "detection_alerts":
                     existing_core = await conn.fetchrow(
                         """
                         SELECT acknowledged
                         FROM detection_alerts
-                        WHERE id=$1
+                        WHERE id=$1 AND created_at=$2
                         """,
                         processed["id"],
+                        processed["created_at"],
                     )
                 else:
                     existing_core = await conn.fetchrow(
                         f"""
                         SELECT 1
                         FROM {table}
-                        WHERE id=$1
+                        WHERE id=$1 AND created_at=$2
                         """,
                         processed["id"],
+                        processed["created_at"],
                     )
                 exists = bool(existing_core)
 
@@ -275,30 +283,32 @@ async def apply_edge_data(pool, table: str, data: Dict[str, Any]):
 
                 if update_data:
                     set_clause = ", ".join(
-                        f"{k}=${i+3}" for i, k in enumerate(update_data)
+                        f"{k}=${i+4}" for i, k in enumerate(update_data)
                     )
 
-                    if processed.get("edge_id"):
+                    if processed.get("edge_id") and processed.get("created_at"):
                         sql = f"""
                             UPDATE {table}
                             SET {set_clause}
-                            WHERE id=$1 AND edge_id=$2
+                            WHERE id=$1 AND edge_id=$2 AND created_at=$3
                         """
                         await conn.execute(
                             sql,
                             processed["id"],
                             processed["edge_id"],
+                            processed["created_at"],
                             *update_data.values(),
                         )
-                    else:
+                    elif processed.get("created_at"):
                         sql = f"""
                             UPDATE {table}
                             SET {set_clause}
-                            WHERE id=$1
+                            WHERE id=$1 AND created_at=$2
                         """
                         await conn.execute(
                             sql,
                             processed["id"],
+                            processed["created_at"],
                             *update_data.values(),
                         )
 
