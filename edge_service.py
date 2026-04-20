@@ -104,7 +104,7 @@ async def upload_image_to_bucket(pool, alert_record):
         
         # Convert container path to actual mounted path
         if detection_frame_path.startswith('/app/storage/detection_frames/'):
-            actual_path = detection_frame_path.replace('/app/storage/detection_frames/', '/home/camnitive-5/camnitive/camedge/storage/detection_frames/')
+            actual_path = detection_frame_path.replace('/app/storage/detection_frames/', '/opt/camnitive/storage/detection_frames/')
         else:
             actual_path = detection_frame_path
             
@@ -235,8 +235,8 @@ async def process_upload_retry_queue(pool):
 mqtt_client = mqtt.Client()
 mqtt_client.tls_set(
     ca_certs="./certs/serverca1.crt",
-    certfile="./certs/mqtt-client-c1.crt",
-    keyfile="./certs/mqtt-client-c1.private.pem",
+    certfile="./certs/edge-cert.crt",
+    keyfile="./certs/edge-cert.private.pem",
 )
 mqtt_client.tls_insecure_set(False)
 
@@ -299,7 +299,7 @@ async def publish_table_data(pool, table_name):
         async with pool.acquire() as conn:
             query_from_id = last_seen_ids[table_name]
             
-            print(f"[{table_name}] Querying records with ID > {query_from_id}")
+            # print(f"[{table_name}] Querying records with ID > {query_from_id}")
 
             rows = await conn.fetch(
                 f"""
@@ -316,7 +316,7 @@ async def publish_table_data(pool, table_name):
                 print(f"[{table_name}] No new records found")
                 return
                 
-            print(f"[{table_name}] Found {len(rows)} new records to publish")
+            # print(f"[{table_name}] Found {len(rows)} new records to publish")
 
             for row in rows:
                 payload = dict(row)
@@ -345,16 +345,17 @@ async def publish_table_data(pool, table_name):
 
                 # 🔑 advance cursor ONLY after successful publish
                 last_seen_ids[table_name] = row["id"]
-                print(f"[{table_name}] Successfully published record ID {row['id']}")
+                # print(f"[{table_name}] Successfully published record ID {row['id']}")
                 
-            print(f"[{table_name}] Completed batch: published {len(rows)} records, last ID: {last_seen_ids[table_name]}")
+            # print(f"[{table_name}] Completed batch: published {len(rows)} records, last ID: {last_seen_ids[table_name]}")
 
             if not initial_sync_done[table_name]:
                 initial_sync_done[table_name] = True
                 print(f"[{table_name}] Initial sync completed")
 
     except Exception as e:
-        print(f"[{table_name}] ERROR in publish_table_data: {e}")
+        pass
+        # print(f"[{table_name}] ERROR in publish_table_data: {e}")
         # Don't crash, just log the error and continue
 
 async def publish_detection_alerts(pool):
@@ -390,14 +391,14 @@ async def publish_detection_alerts(pool):
                 
                 # Check if core_url is missing or empty
                 if not core_url or core_url.strip() == '':
-                    print(f"[detection_alerts] Alert {alert_id}: Missing core_url, checking image file")
+                    # print(f"[detection_alerts] Alert {alert_id}: Missing core_url, checking image file")
                     
                     # Check if image file exists before attempting upload
                     detection_frame_path = alert_record.get('detection_frame_path')
                     if detection_frame_path:
                         # Convert container path to actual mounted path
                         if detection_frame_path.startswith('/app/storage/detection_frames/'):
-                            actual_path = detection_frame_path.replace('/app/storage/detection_frames/', '/opt/camnitive/camedge/storage/detection_frames/')
+                            actual_path = detection_frame_path.replace('/app/storage/detection_frames/', '/opt/camnitive/storage/detection_frames/')
                         else:
                             actual_path = detection_frame_path
                             

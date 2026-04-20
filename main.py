@@ -44,6 +44,7 @@ DATETIME_FIELDS = {
     "created_at",
     "updated_at",
     "event_time",
+    "event_time_local",
     "acknowledged_at",
 }
 
@@ -67,9 +68,21 @@ def parse_datetimes(data: Dict[str, Any]) -> Dict[str, Any]:
     for k, v in data.items():
         if k in DATETIME_FIELDS and isinstance(v, str) and v:
             try:
-                parsed[k] = datetime.fromisoformat(v.replace("Z", "+00:00"))
-            except ValueError:
-                parsed[k] = v
+                if k == "event_time_local":
+                    # Handle local time format: "2026-03-25 20:35:24.955131"
+                    # Parse as naive datetime (no timezone info)
+                    parsed[k] = datetime.fromisoformat(v)
+                else:
+                    # Handle UTC datetime formats for other fields
+                    if v.endswith('Z'):
+                        parsed[k] = datetime.fromisoformat(v.replace("Z", "+00:00"))
+                    else:
+                        parsed[k] = datetime.fromisoformat(v)
+            except ValueError as e:
+                print(f"[DATETIME_PARSE] Failed to parse {k}='{v}': {e}")
+                # If parsing fails, set to None instead of keeping string
+                # This prevents database type errors
+                parsed[k] = None
         else:
             parsed[k] = v
     return parsed
@@ -154,8 +167,19 @@ async def apply_core_update(pool, table: str, data: Dict[str, Any]):
 # =========================================================
 async def apply_edge_data(pool, table: str, data: Dict[str, Any]):
     try:
+        # Debug: Show original data datetime fields
+        dt_fields_in_data = {k: v for k, v in data.items() if isinstance(v, str) and ('T' in v or '-' in v) and len(v) > 10}
+        if dt_fields_in_data:
+            print(f"[{table}] Datetime-like fields in original data: {dt_fields_in_data}")
+        
         processed = parse_datetimes(data)
         record_id = processed.get("id", "unknown")
+        
+        # Debug: Show processed datetime fields
+        processed_dt_fields = {k: v for k, v in processed.items() if k in DATETIME_FIELDS}
+        if processed_dt_fields:
+            print(f"[{table}] Processed datetime fields: {processed_dt_fields}")
+        
         print(f"[{table}] Processing edge data for record ID {record_id}")
 
         # --------------------------------------------------
@@ -165,7 +189,7 @@ async def apply_edge_data(pool, table: str, data: Dict[str, Any]):
             "advanced_rulesets": ["camera_id"],
             "advanced_rules": [],
             "rule_assignments": [],
-            "cameras": ["input_size"],
+            "cameras": [],
             "detection_alerts": [],
         }
 
@@ -321,6 +345,12 @@ async def apply_edge_data(pool, table: str, data: Dict[str, Any]):
                 cols = ", ".join(processed.keys())
                 placeholders = ", ".join(f"${i+1}" for i in range(len(processed)))
                 sql = f"INSERT INTO {table} ({cols}) VALUES ({placeholders})"
+
+                # Debug: Show all values and their types
+                values = list(processed.values())
+                print(f"[{table}] INSERT VALUES DEBUG:")
+                for i, (k, v) in enumerate(processed.items()):
+                    print(f"  ${i+1} {k}: {type(v).__name__} = {repr(v)}")
 
                 try:
                     await conn.execute(sql, *processed.values())
